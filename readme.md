@@ -254,5 +254,52 @@ spec:
       periodSeconds: 10
 EOF
 ```
+### Mitigations
+Probes are attacker-controlled code paths that ship *inside a manifest* and are executed by the `kubelet`. Defending against the techniques above is therefore about controlling the manifest and constraining what a probe can reach — not about trusting the image. Image scanning and trusted registries do **not** help here, because nothing malicious lives in the image; the payload is in the pod spec.
+
+**1. Treat manifests as code.** The probe `command`, `httpGet.host`, and `httpHeaders` are as security-sensitive as the container's `args`. Review them in pull requests / GitOps exactly as you would application code, and keep a human (or a policy) in the loop before anything reaches the cluster.
+
+**2. Block off-cluster `httpGet` probes with admission control.** An `httpGet` probe with an explicit `host` lets the kubelet reach arbitrary external endpoints (bypassing `NetworkPolicy`). A native `ValidatingAdmissionPolicy` (CEL, GA since Kubernetes v1.30 — no external webhook required) rejects that pattern cheaply:
+```
+kubectl apply -f - <<EOF
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: no-offcluster-probe-host
+spec:
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+    - apiGroups:   [""]
+      apiVersions: ["v1"]
+      operations:  ["CREATE", "UPDATE"]
+      resources:   ["pods"]
+  validations:
+  - expression: >-
+      !object.spec.containers.exists(c,
+        (has(c.livenessProbe)  && has(c.livenessProbe.httpGet)  && has(c.livenessProbe.httpGet.host))  ||
+        (has(c.readinessProbe) && has(c.readinessProbe.httpGet) && has(c.readinessProbe.httpGet.host)) ||
+        (has(c.startupProbe)   && has(c.startupProbe.httpGet)   && has(c.startupProbe.httpGet.host)))
+    message: "probe httpGet.host is not allowed (prevents the kubelet probing off-cluster targets)"
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: no-offcluster-probe-host-binding
+spec:
+  policyName: no-offcluster-probe-host
+  validationActions: ["Deny"]
+  matchResources:
+    namespaceSelector: {}
+EOF
+```
+Extend the same expression to `initContainers` and `ephemeralContainers`. Kyverno or OPA/Gatekeeper can express the identical rule if you already run one of them.
+
+**3. Constrain `exec` probes.** `exec` probes are legitimate and widely used (`cat /tmp/healthy`, `pg_isready`, ...), so a blanket ban usually breaks real workloads. Instead review them, and where possible enforce an allowlist of probe commands via policy — rejecting probes that invoke package managers or network tools (`apt-get`, `curl`, `nc`, `ncat`, `bash -c`). A minimal, hardened container (no shell, no `curl`/`apt`/`nc`, read-only root filesystem, non-root, dropped capabilities) also sharply limits what an exec probe can accomplish.
+
+**4. Control node egress.** Because `httpGet` probes originate from the kubelet (host network namespace), they are **not** filtered by Kubernetes `NetworkPolicy`. Restrict node egress at the infrastructure layer (cloud security groups / firewall) so the kubelet cannot reach arbitrary external hosts.
+
+**5. Detect at runtime.** Pair the above with runtime security (Falco, Tetragon) to alert on unexpected process execution or outbound connections triggered by probe execution — see the companion [`poc_netpos_probes_attack`](https://github.com/k8ssecurity/poc_netpos_probes_attack) repo for a Falco rule that flags kubelet outbound connections.
+
 ### Conclusion
 Many things are written on securely deploying applications on kubernetes. Keep in mind that all aspects need full attention. Generating and building Kubernetes manifest is also developping code.
